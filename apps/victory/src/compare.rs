@@ -76,7 +76,7 @@ impl Outcome {
 }
 
 /// One line of the list into the program's key and the line's outcome.
-fn split(line: &str) -> Option<(String, &str)> {
+fn split(line: &str) -> Option<(String, &str, &str)> {
     // A validator's message may hold two spaces itself: the outcome starts
     // at the first pair that ends a program's label.
     let cut = line
@@ -84,7 +84,8 @@ fn split(line: &str) -> Option<(String, &str)> {
         .map(|(at, _)| at)
         .find(|&at| ends_a_label(&line[..at]))?;
     let (label, outcome) = line.split_at(cut);
-    Some((key(label)?, &outcome[2..]))
+    let (key, file) = key(label)?;
+    Some((key, file, &outcome[2..]))
 }
 
 /// Whether `head` ends in a stage, as a program's label does, with the
@@ -105,7 +106,7 @@ fn ends_a_label(head: &str) -> bool {
 /// `translate` writes it, into its key: the file's name and the rest, so
 /// that copies of the title in other folders compare. `None` if the label
 /// names no program.
-fn key(label: &str) -> Option<String> {
+fn key(label: &str) -> Option<(String, &str)> {
     // A refusal's instruction offset is no part of which program it is.
     let label = match label.rsplit_once(" at 0x") {
         Some((head, offset)) if offset.chars().all(|c| c.is_ascii_hexdigit()) => head,
@@ -117,39 +118,36 @@ fn key(label: &str) -> Option<String> {
     if offset == 0 {
         return None;
     }
-    let file = file.rsplit(['/', '\\']).next()?;
-    Some(format!(
-        "{file}@0x{}{} {stage}",
-        &rest[..offset],
-        &rest[offset..]
-    ))
+    let name = file.rsplit(['/', '\\']).next()?;
+    Some((format!("{name}@0x{rest} {stage}"), file))
 }
 
-/// Every program of a `translate --list` output, and how many of its keys
-/// two programs share. `None` if no line names a program.
-fn parse(text: &str) -> Option<(Programs, usize)> {
+/// Every program of a `translate --list` output and its count of repeated outcome rows.
+fn parse(text: &str) -> Result<(Programs, usize)> {
     let mut programs = Programs::new();
+    let mut files = BTreeMap::new();
     let mut shared = 0;
     for line in text.lines() {
-        let Some((key, outcome)) = split(line) else {
+        let Some((key, file, outcome)) = split(line) else {
             continue;
         };
+        let previous = files.entry(key.clone()).or_insert(file);
+        anyhow::ensure!(
+            *previous == file,
+            "{key} is ambiguous between {previous} and {file}"
+        );
         if !programs.entry(key).or_default().add(outcome) {
             shared += 1;
         }
     }
-    (!programs.is_empty()).then_some((programs, shared))
+    anyhow::ensure!(!programs.is_empty(), "no programs in translate --list output");
+    Ok((programs, shared))
 }
 
 fn read(path: &Path) -> Result<(Programs, usize)> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    parse(&text).with_context(|| {
-        format!(
-            "{} names no program: not a translate --list output",
-            path.display()
-        )
-    })
+    parse(&text).with_context(|| format!("comparing {}", path.display()))
 }
 
 /// How one check fared: each run's own totals, and the gains and losses
@@ -390,11 +388,8 @@ shaders.rpf@0x70 G_Wrapped Vs  pipeline created\n";
         }
         assert_eq!((before.len(), after.len()), (6, 5));
         // A summary's example is no program line, nor is its header.
-        assert_eq!(
-            parse("      1  emit: x  (e.g. D:\\g\\shaders.rpf@0x20 B Cs)\n"),
-            None
-        );
-        assert_eq!(parse("containers   6\n"), None);
+        assert!(parse("      1  emit: x  (e.g. D:/g/shaders.rpf@0x20 B Cs)\n").is_err());
+        assert!(parse("containers   6\n").is_err());
     }
 
     #[test]
@@ -421,6 +416,16 @@ shaders.rpf@0x70 G_Wrapped Vs  pipeline created\n";
             "only before  2: shaders.rpf@0x30 C_Wrapped Ps, shaders.rpf@0x50 E_Wrapped Cs"
         ));
         assert!(report.contains("only after   1: shaders.rpf@0x70 G_Wrapped Vs"));
+    }
+
+    #[test]
+    fn two_paths_under_one_key_are_ambiguous() {
+        let text = "D:/base/ui/shaders.rpf@0x10 A_Wrapped Cs  pipeline created\n\
+                    D:/base/ui/shaders.rpf@0x10 A_Wrapped Cs  validated\n\
+                    D:/base/world/shaders.rpf@0x10 A_Wrapped Cs  emit: refused\n";
+        let error = parse(text).unwrap_err().to_string();
+        assert!(error.contains("D:/base/ui/shaders.rpf"));
+        assert!(error.contains("D:/base/world/shaders.rpf"));
     }
 
     #[test]
